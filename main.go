@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -41,8 +43,69 @@ type TableOfContentsCache struct {
 	timestamp int64
 }
 
+type Page struct {
+	Url   string `json:"url"`
+	Title string `json:"title"`
+}
+
+func (page *Page) UnmarshalJSON(data []byte) error {
+	var raw [2]json.RawMessage
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(raw[0], &page.Url); err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(raw[1], &page.Title); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type PageInfo struct {
+	Summary string `json:"summary"`
+	Index   int    `json:"index"`
+}
+
+func (pageInfo *PageInfo) UnmarshalJSON(data []byte) error {
+	var raw [2]json.RawMessage
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(raw[0], &pageInfo.Summary); err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(raw[1], &pageInfo.Index); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type SearchIndex struct {
+	Pages       []Page           `json:"pages"`
+	Info        []PageInfo       `json:"info"`
+	Common      map[string]int   `json:"common"`
+	SearchIndex map[string][]int `json:"searchIndex"`
+}
+
+type CompiledSearchResult struct {
+	Page
+	PageInfo
+}
+
+const MaxQueryLength = 50
+
 func main() {
-	cacheMap := sync.Map{}
+	tableOfContentsCacheMap := sync.Map{}
+	indexCacheMap := sync.Map{}
 
 	router := gin.Default()
 	router.Use(cors.New(cors.Config{
@@ -59,6 +122,87 @@ func main() {
 
 	router.GET("/*path", func(ctx *gin.Context) {
 		pagePath := ctx.Param("path")
+
+		if pagePath == "/search" {
+			searchType := ctx.Query("type")
+			version := ctx.Query("version")
+
+			query := strings.TrimSpace(strings.ToLower(ctx.Query("query")))
+			if len(query) > MaxQueryLength {
+				query = query[0:MaxQueryLength]
+			}
+
+			if len(query) == 0 {
+				ctx.String(http.StatusBadRequest, "Error: Query (`query`) query parameter is incorrect missing!")
+				return
+			}
+
+			var isManual bool
+			switch searchType {
+			case "1":
+				isManual = true
+			case "2":
+				isManual = false
+			default:
+				ctx.String(http.StatusBadRequest, "Error: Search Type (`type`) query parameter is incorrect or missing!")
+				return
+			}
+
+			var pathSearchType string
+			if isManual {
+				pathSearchType = "Manual"
+			} else {
+				pathSearchType = "ScriptReference"
+			}
+
+			pathVersion := version
+			if len(pathVersion) > 0 {
+				pathVersion += "/"
+			}
+
+			key := fmt.Sprintf("%s_%s", pathVersion, pathSearchType)
+			searchIndex, exists := indexCacheMap.Load(key)
+			if !exists {
+
+				url := fmt.Sprintf("https://docs.unity3d.com/%sDocumentation/%s/docdata/index.json", pathVersion, pathSearchType)
+
+				request, err := http.NewRequest("GET", url, nil)
+				if err != nil {
+					ctx.String(http.StatusInternalServerError, err.Error())
+					return
+				}
+
+				request.Header.Set("User-Agent", "Mozilla/5.0")
+
+				response, err := client.Do(request)
+				if err != nil {
+					ctx.String(http.StatusInternalServerError, err.Error())
+					return
+				}
+
+				defer response.Body.Close()
+
+				indexBytes, err := io.ReadAll(response.Body)
+				if err != nil {
+					ctx.String(http.StatusInternalServerError, err.Error())
+					return
+				}
+
+				var newSearchIndex SearchIndex
+				if err := json.Unmarshal(indexBytes, &newSearchIndex); err != nil {
+					ctx.String(http.StatusInternalServerError, err.Error())
+					return
+				}
+
+				searchIndex = &newSearchIndex
+				indexCacheMap.Store(key, searchIndex)
+			}
+
+			searchResults := PerformSearch(query, (searchIndex.(*SearchIndex)))
+			ctx.JSON(http.StatusOK, searchResults)
+
+			return
+		}
 
 		pageUrl := "https://docs.unity3d.com" + pagePath
 		request, err := http.NewRequest("GET", pageUrl, nil)
@@ -142,7 +286,7 @@ func main() {
 		re := regexp.MustCompile(".+(ScriptReference|Manual)")
 		tocPath := re.FindString(pagePath) + "/docdata/toc.json"
 
-		toc, exists := cacheMap.Load(tocPath)
+		toc, exists := tableOfContentsCacheMap.Load(tocPath)
 		if !exists || time.Since(time.Unix(toc.(TableOfContentsCache).timestamp, 0)) > time.Duration(time.Hour*24) {
 			request, err := http.NewRequest("GET", "https://docs.unity3d.com"+tocPath, nil)
 			if err != nil {
@@ -171,7 +315,7 @@ func main() {
 				time.Now().Unix(),
 			}
 
-			cacheMap.Store(tocPath, toc)
+			tableOfContentsCacheMap.Store(tocPath, toc)
 		}
 
 		pageResult := PageResult{
